@@ -1167,7 +1167,7 @@ class TestSessionSwitchBufferFlush:
         assert row.item["metadata"]["session_id"] == "test-session"
         assert "old-user" in row.item["content"]
         assert "old-user-2" in row.item["content"]
-        p._outbox.close()
+        p.shutdown()
 
     def test_in_flight_prefetch_thread_drained_on_switch(self, provider, monkeypatch):
         """on_session_switch must wait for an in-flight prefetch from the

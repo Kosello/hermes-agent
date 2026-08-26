@@ -21,6 +21,7 @@ class OutboxRow:
     update_mode: str | None
     retain_async: bool
     operation_id: str | None
+    claim_token: str | None
     item: dict[str, Any]
     attempts: int
     available_at: float
@@ -58,6 +59,7 @@ class HindsightOutbox:
                 update_mode TEXT,
                 retain_async INTEGER NOT NULL,
                 operation_id TEXT,
+                claim_token TEXT,
                 item_json TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 available_at REAL NOT NULL,
@@ -73,6 +75,8 @@ class HindsightOutbox:
         }
         if "operation_id" not in columns:
             self._db.execute("ALTER TABLE hindsight_outbox ADD COLUMN operation_id TEXT")
+        if "claim_token" not in columns:
+            self._db.execute("ALTER TABLE hindsight_outbox ADD COLUMN claim_token TEXT")
         if "replay_eligible" not in columns:
             self._db.execute(
                 "ALTER TABLE hindsight_outbox "
@@ -137,44 +141,61 @@ class HindsightOutbox:
 
     def claim_due(self, *, limit: int = 1, replay_only: bool = False) -> list[OutboxRow]:
         now = time.time()
-        replay_clause = " AND replay_eligible = 1" if replay_only else ""
+        replay_clause = " AND current.replay_eligible = 1" if replay_only else ""
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 rows = self._db.execute(
                     f"""
-                    SELECT * FROM hindsight_outbox
-                    WHERE state = 'pending' AND available_at <= ?{replay_clause}
-                    ORDER BY id LIMIT ?
+                    SELECT current.* FROM hindsight_outbox AS current
+                    WHERE current.state = 'pending' AND current.available_at <= ?{replay_clause}
+                      AND NOT EXISTS (
+                        SELECT 1 FROM hindsight_outbox AS previous
+                        WHERE previous.document_id = current.document_id
+                          AND previous.id < current.id
+                          AND previous.state IN ('pending', 'in_flight')
+                      )
+                    ORDER BY current.id LIMIT ?
                     """,
                     (now, limit),
                 ).fetchall()
                 ids = [row["id"] for row in rows]
+                claim_tokens = {row_id: str(uuid.uuid4()) for row_id in ids}
                 if ids:
                     self._db.executemany(
                         """
                         UPDATE hindsight_outbox
-                        SET state='in_flight', claimed_at=?, replay_eligible=0
+                        SET state='in_flight', claimed_at=?, claim_token=?, replay_eligible=0
                         WHERE id=?
                         """,
-                        [(now, row_id) for row_id in ids],
+                        [(now, claim_tokens[row_id], row_id) for row_id in ids],
                     )
                 self._db.commit()
             except Exception:
                 self._db.rollback()
                 raise
-        return [self._row(row) for row in rows]
+        return [
+            self._row({**dict(row), "claim_token": claim_tokens[row["id"]]})
+            for row in rows
+        ]
 
     def claim(self, row_id: int) -> OutboxRow | None:
         now = time.time()
+        claim_token = str(uuid.uuid4())
         with self._lock, self._db:
             cur = self._db.execute(
                 """
                 UPDATE hindsight_outbox
-                SET state='in_flight', claimed_at=?, replay_eligible=0
+                SET state='in_flight', claimed_at=?, claim_token=?, replay_eligible=0
                 WHERE id=? AND state='pending' AND available_at <= ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM hindsight_outbox AS previous
+                    WHERE previous.document_id = hindsight_outbox.document_id
+                      AND previous.id < hindsight_outbox.id
+                      AND previous.state IN ('pending', 'in_flight')
+                  )
                 """,
-                (now, row_id, now),
+                (now, claim_token, row_id, now),
             )
             if cur.rowcount != 1:
                 return None
@@ -201,28 +222,52 @@ class HindsightOutbox:
             raise KeyError(f"Hindsight outbox row not found: {row_id}")
         return str(row["operation_id"])
 
-    def acknowledge(self, row_id: int) -> None:
+    def acknowledge(self, row_id: int, *, claim_token: str | None) -> bool:
+        if not claim_token:
+            return False
         with self._lock, self._db:
-            self._db.execute("DELETE FROM hindsight_outbox WHERE id = ?", (row_id,))
+            cur = self._db.execute(
+                """
+                DELETE FROM hindsight_outbox
+                WHERE id=? AND state='in_flight' AND claim_token=?
+                """,
+                (row_id, claim_token),
+            )
+        return cur.rowcount == 1
 
-    def reschedule(self, row_id: int, error: str, *, delay_seconds: float) -> None:
+    def reschedule(
+        self,
+        row_id: int,
+        error: str,
+        *,
+        claim_token: str | None,
+        delay_seconds: float,
+    ) -> bool:
+        if not claim_token:
+            return False
         with self._lock, self._db:
-            self._db.execute(
+            cur = self._db.execute(
                 """
                 UPDATE hindsight_outbox
                 SET state='pending', attempts=attempts+1, available_at=?,
-                    last_error=?, claimed_at=NULL, replay_eligible=1
-                WHERE id=?
+                    last_error=?, claimed_at=NULL, claim_token=NULL, replay_eligible=1
+                WHERE id=? AND state='in_flight' AND claim_token=?
                 """,
-                (time.time() + max(0.0, delay_seconds), str(error)[:2000], row_id),
+                (
+                    time.time() + max(0.0, delay_seconds),
+                    str(error)[:2000],
+                    row_id,
+                    claim_token,
+                ),
             )
+        return cur.rowcount == 1
 
     def release_stale_claims(self, *, lease_seconds: float = 300) -> int:
         with self._lock, self._db:
             cur = self._db.execute(
                 """
                 UPDATE hindsight_outbox
-                SET state='pending', claimed_at=NULL, available_at=?
+                SET state='pending', claimed_at=NULL, claim_token=NULL, available_at=?
                 WHERE state='in_flight' AND claimed_at < ?
                 """,
                 (time.time(), time.time() - lease_seconds),
@@ -241,6 +286,20 @@ class HindsightOutbox:
             )
         return cur.rowcount
 
+    def has_due(self, *, replay_only: bool = False) -> bool:
+        """Return whether a pending row is ready for the delivery coordinator."""
+        replay_clause = " AND replay_eligible = 1" if replay_only else ""
+        with self._lock:
+            row = self._db.execute(
+                f"""
+                SELECT 1 FROM hindsight_outbox
+                WHERE state='pending' AND available_at <= ?{replay_clause}
+                LIMIT 1
+                """,
+                (time.time(),),
+            ).fetchone()
+        return row is not None
+
     def _row(self, row: sqlite3.Row) -> OutboxRow:
         return OutboxRow(
             id=int(row["id"]),
@@ -250,6 +309,7 @@ class HindsightOutbox:
             update_mode=row["update_mode"],
             retain_async=bool(row["retain_async"]),
             operation_id=row["operation_id"],
+            claim_token=row["claim_token"],
             item=json.loads(row["item_json"]),
             attempts=int(row["attempts"]),
             available_at=float(row["available_at"]),

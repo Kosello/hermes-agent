@@ -66,9 +66,13 @@ The local feature branch contains the following client-side changes:
 - Uses a unique `dedupe_key` to prevent duplicate local enqueue rows.
 - Uses SQLite `BEGIN IMMEDIATE` plus a process lock so separate outbox instances cannot
   claim the same row concurrently.
+- Claims carry a unique lease token; acknowledgement and retry state changes require
+  the current token, so a stale worker cannot mutate a row reclaimed after a crash.
+- Same-document rows are predecessor-ordered: a later row cannot be claimed while an
+  earlier row for that document is pending or in flight.
 - Uses WAL mode and a busy timeout for concurrent readers/workers.
 - Releases stale claims after restart and activates pending rows for replay.
-- Uses a `replay_eligible` marker so a startup replay worker cannot steal a freshly
+- Uses a `replay_eligible` marker so the replay scheduler cannot steal a freshly
   enqueued row from Hermes' existing lazy writer.
 - Uses bounded exponential retry delays and keeps failed rows on disk.
 - Applies file mode `0600` where the operating system supports it.
@@ -80,10 +84,12 @@ The local feature branch contains the following client-side changes:
   state before rotation, and flushes only the unsent suffix for append-mode
   documents.
 - Keeps the existing lazy writer behavior for new rows.
-- Adds a separate durable replay worker for rows left by a previous process or retry.
+- Adds a separate durable replay scheduler for rows left by a previous process or retry.
+- The replay scheduler only signals the writer; replay and fresh retains share one ordered
+  writer coordinator and therefore cannot dispatch concurrently through two paths.
 - Passes the stable `operation_id` to `aretain_batch` when the installed SDK exposes
   that parameter and the retain is asynchronous.
-- Wakes the replay worker when a new retain is queued.
+- Wakes the replay scheduler when a new retain is queued.
 - Avoids closing the SQLite database or Hindsight client underneath a worker that did
   not stop within the bounded shutdown window.
 - Keeps the first server-operation status poll fast: 404 detection uses the SDK
@@ -115,6 +121,7 @@ The tests cover:
 - private database permissions;
 - provider behavior when Hindsight is offline, including session-switch flushes;
 - append-mode session-switch flushing without duplicate turns.
+- same-document claim ordering and stale-worker fencing.
 
 Run them with an interpreter containing the pinned SDK:
 

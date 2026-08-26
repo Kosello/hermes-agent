@@ -313,9 +313,10 @@ _loop: asyncio.AbstractEventLoop | None = None
 _loop_thread: threading.Thread | None = None
 _loop_lock = threading.Lock()
 
-# Sentinel pushed to the per-provider retain queue to wake the writer for a
-# clean exit. A unique object so it can never collide with a real job.
+# Sentinels pushed to the per-provider retain queue. Unique objects so they can
+# never collide with real jobs.
 _WRITER_SENTINEL = object()
+_OUTBOX_WAKEUP = object()
 
 
 def _get_loop() -> asyncio.AbstractEventLoop:
@@ -1336,6 +1337,8 @@ class HindsightMemoryProvider(MemoryProvider):
         We don't start the writer in initialize() so providers that never
         retain (e.g. tools-only mode) don't pay for an idle thread.
         """
+        if self._shutting_down.is_set():
+            return
         thread = self._writer_thread
         if thread is not None and thread.is_alive():
             return
@@ -1531,14 +1534,17 @@ class HindsightMemoryProvider(MemoryProvider):
                 if job is _WRITER_SENTINEL:
                     return
                 try:
-                    job()
+                    if job is _OUTBOX_WAKEUP:
+                        self._deliver_next_outbox_row()
+                    else:
+                        job()
                 except Exception as exc:
                     logger.warning("Hindsight retain failed: %s", exc, exc_info=True)
             finally:
                 self._retain_queue.task_done()
 
     def _ensure_outbox_replay(self) -> None:
-        """Start the durable replay worker without starting the legacy writer."""
+        """Start the replay scheduler without eagerly starting the writer."""
         thread = self._outbox_replay_thread
         if thread is not None and thread.is_alive():
             return
@@ -1551,19 +1557,26 @@ class HindsightMemoryProvider(MemoryProvider):
         thread.start()
 
     def _outbox_replay_loop(self) -> None:
-        """Replay persisted rows after startup and whenever Hindsight recovers."""
+        """Wake the ordered writer when persisted rows become deliverable."""
         while not self._shutting_down.is_set():
-            rows: list[OutboxRow] = []
             if self._outbox is not None:
                 try:
-                    rows = self._outbox.claim_due(limit=1, replay_only=True)
+                    if self._outbox.has_due(replay_only=True):
+                        self._ensure_writer()
+                        if not self._shutting_down.is_set():
+                            self._retain_queue.put(_OUTBOX_WAKEUP)
                 except Exception as exc:
                     logger.warning("Hindsight outbox read failed: %s", exc)
-            if rows:
-                self._deliver_outbox_row(rows[0])
-                continue
             self._outbox_wakeup.wait(timeout=1.0)
             self._outbox_wakeup.clear()
+
+    def _deliver_next_outbox_row(self) -> None:
+        """Claim and deliver the oldest eligible row on the writer thread."""
+        if self._outbox is None:
+            return
+        rows = self._outbox.claim_due(limit=1)
+        if rows:
+            self._deliver_outbox_row(rows[0])
 
     def _retain_batch_from_outbox(self, client, row: OutboxRow):
         """Send a queued retain, using idempotency when the SDK exposes it."""
@@ -1598,6 +1611,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     update_mode=row.update_mode,
                     retain_async=row.retain_async,
                     operation_id=operation_id,
+                    claim_token=row.claim_token,
                     item=row.item,
                     attempts=row.attempts,
                     available_at=row.available_at,
@@ -1610,14 +1624,30 @@ class HindsightMemoryProvider(MemoryProvider):
             if row.retain_async:
                 self._track_retain_ops(resp, row.bank_id)
             if self._outbox is not None:
-                self._outbox.acknowledge(row.id)
+                acknowledged = self._outbox.acknowledge(
+                    row.id, claim_token=row.claim_token
+                )
+                if not acknowledged:
+                    logger.warning(
+                        "Hindsight outbox row %s was reclaimed before acknowledgement",
+                        row.id,
+                    )
+                    return
             logger.debug("Hindsight outbox delivery succeeded: row=%s", row.id)
         except Exception as exc:
             delay = min(300.0, float(2 ** min(row.attempts, 8)))
             if self._outbox is not None:
-                self._outbox.reschedule(
-                    row.id, type(exc).__name__, delay_seconds=delay
+                rescheduled = self._outbox.reschedule(
+                    row.id,
+                    type(exc).__name__,
+                    claim_token=row.claim_token,
+                    delay_seconds=delay,
                 )
+                if not rescheduled:
+                    logger.warning(
+                        "Hindsight outbox row %s was reclaimed before reschedule",
+                        row.id,
+                    )
             logger.warning(
                 "Hindsight unavailable; retain row %s kept for retry in %.0fs: %s",
                 row.id, delay, exc,
@@ -2269,7 +2299,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if update_mode is not None:
             item["update_mode"] = update_mode
         dedupe_key = f"{document_id}:{self._turn_index}:{num_turns}"
-        row_id = self._outbox.enqueue(
+        self._outbox.enqueue(
             dedupe_key=dedupe_key,
             bank_id=bank_id,
             document_id=document_id,
@@ -2279,11 +2309,7 @@ class HindsightMemoryProvider(MemoryProvider):
         )
 
         def _do_retain() -> None:
-            row = self._outbox.claim(row_id)
-            if row is not None:
-                logger.debug("Hindsight retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
-                             bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns)
-                self._deliver_outbox_row(row)
+            self._deliver_next_outbox_row()
 
         self._ensure_writer()
         self._register_atexit()
@@ -2485,7 +2511,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 item.pop("retain_async", None)
                 if old_update_mode is not None:
                     item["update_mode"] = old_update_mode
-                old_row_id = self._outbox.enqueue(
+                self._outbox.enqueue(
                     dedupe_key=(
                         f"{old_document_id}:session-switch:"
                         f"{old_turn_index}:{len(old_turns_to_flush)}"
@@ -2500,16 +2526,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 def _flush():
                     if self._shutting_down.is_set():
                         return
-                    row = self._outbox.claim(old_row_id)
-                    if row is not None:
-                        logger.debug(
-                            "Hindsight flush-on-switch: bank=%s, doc=%s, mode=%s, num_turns=%d",
-                            old_bank_id,
-                            old_document_id,
-                            old_update_mode,
-                            len(old_turns_to_flush),
-                        )
-                        self._deliver_outbox_row(row)
+                    self._deliver_next_outbox_row()
 
                 # Route the flush through the same writer queue sync_turn
                 # uses. That serializes it behind any still-queued retains

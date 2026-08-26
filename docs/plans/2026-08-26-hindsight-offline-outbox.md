@@ -36,6 +36,8 @@ The following are intentionally separate follow-ups and are not acceptance crite
 - Successful retains are removed only after the retain API call succeeds.
 - Replays use a persisted operation ID for supported asynchronous clients and a unique deduplication key for local enqueue races.
 - Concurrent outbox instances cannot claim the same row.
+- Later rows for one document cannot overtake an earlier pending/in-flight row, and
+  stale workers cannot acknowledge or reschedule a row after lease reclamation.
 - Shutdown does not lose rows already persisted in the outbox.
 - Hindsight's server, database, memory processing, and recall behavior remain unchanged.
 - Focused outbox and provider tests pass in an environment with `hindsight-client==0.9.2`.

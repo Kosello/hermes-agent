@@ -65,7 +65,9 @@ def test_failed_delivery_remains_due_after_reschedule(tmp_path):
     row_id = outbox.enqueue(**entry())
     row = outbox.claim_due(limit=1)[0]
 
-    outbox.reschedule(row.id, "connection refused", delay_seconds=0)
+    outbox.reschedule(
+        row.id, "connection refused", claim_token=row.claim_token, delay_seconds=0
+    )
     retry = outbox.claim_due(limit=1)[0]
 
     assert retry.id == row_id
@@ -93,6 +95,41 @@ def test_claim_due_is_atomic_across_outbox_connections(tmp_path):
     second.close()
 
 
+def test_same_document_rows_are_claimed_in_order(tmp_path):
+    outbox = HindsightOutbox(tmp_path / "outbox.sqlite3")
+    first_id = outbox.enqueue(**entry(dedupe_key="session-1:turn-1"))
+    second_id = outbox.enqueue(**entry(dedupe_key="session-1:turn-2"))
+
+    first = outbox.claim_due(limit=1)[0]
+    assert first.id == first_id
+    assert outbox.claim_due(limit=1) == []
+
+    outbox.acknowledge(first.id, claim_token=first.claim_token)
+    second = outbox.claim_due(limit=1)[0]
+    assert second.id == second_id
+    outbox.close()
+
+
+def test_stale_claimant_cannot_mutate_reclaimed_row(tmp_path):
+    outbox = HindsightOutbox(tmp_path / "outbox.sqlite3")
+    row_id = outbox.enqueue(**entry())
+    stale = outbox.claim_due(limit=1)[0]
+    assert stale.claim_token
+
+    outbox.release_stale_claims(lease_seconds=0)
+    fresh = outbox.claim_due(limit=1)[0]
+    assert fresh.claim_token != stale.claim_token
+
+    outbox.acknowledge(row_id, claim_token=stale.claim_token)
+    outbox.reschedule(row_id, "stale", claim_token=stale.claim_token, delay_seconds=0)
+
+    outbox.release_stale_claims(lease_seconds=0)
+    current = outbox.claim_due(limit=1)[0]
+    assert current.attempts == 0
+    assert current.last_error is None
+    outbox.close()
+
+
 def test_restart_activates_pending_rows_for_replay(tmp_path):
     path = tmp_path / "outbox.sqlite3"
     first = HindsightOutbox(path)
@@ -111,9 +148,9 @@ def test_restart_activates_pending_rows_for_replay(tmp_path):
 def test_acknowledge_removes_successful_delivery(tmp_path):
     outbox = HindsightOutbox(tmp_path / "outbox.sqlite3")
     row_id = outbox.enqueue(**entry())
-    outbox.claim_due(limit=1)
+    row = outbox.claim_due(limit=1)[0]
 
-    outbox.acknowledge(row_id)
+    outbox.acknowledge(row_id, claim_token=row.claim_token)
 
     assert outbox.claim_due(limit=1) == []
     outbox.close()
