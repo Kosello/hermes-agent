@@ -2443,16 +2443,8 @@ class HindsightMemoryProvider(MemoryProvider):
             old_session_id = self._session_id
             old_parent_session_id = self._parent_session_id
             old_turn_index = self._turn_index
-            old_metadata = self._build_metadata(
-                message_count=len(old_turns) * 2,
-                turn_index=old_turn_index,
-            )
-            old_lineage_tags: list[str] = []
-            if old_session_id:
-                old_lineage_tags.append(f"session:{old_session_id}")
-            if old_parent_session_id:
-                old_lineage_tags.append(f"parent:{old_parent_session_id}")
-            old_content = "[" + ",".join(old_turns) + "]"
+            old_retain_async = self._retain_async
+            old_retain_context = self._retain_context
             # Resolve doc_id + update_mode against the OLD session BEFORE
             # we rotate _session_id, so the flush lands in the old
             # session's document either way (legacy: per-process unique;
@@ -2460,44 +2452,75 @@ class HindsightMemoryProvider(MemoryProvider):
             old_document_id, old_update_mode = self._resolve_retain_target(
                 self._document_id
             )
+            # Append-mode retains already queued before the switch cover the
+            # prefix of _session_turns. Flush only the unsent suffix; legacy
+            # overwrite-mode retains must resend the complete session.
+            old_turns_to_flush = (
+                old_turns[self._last_retained_turn_count:]
+                if old_update_mode == "append"
+                else old_turns
+            )
+            if old_turns_to_flush:
+                old_metadata = self._build_metadata(
+                    message_count=len(old_turns_to_flush) * 2,
+                    turn_index=old_turn_index,
+                )
+                old_lineage_tags: list[str] = []
+                if old_session_id:
+                    old_lineage_tags.append(f"session:{old_session_id}")
+                if old_parent_session_id:
+                    old_lineage_tags.append(f"parent:{old_parent_session_id}")
+                old_content = "[" + ",".join(old_turns_to_flush) + "]"
+                # Build the item and persist it before rotating session state.
+                # The writer closure must not read mutable per-session fields:
+                # after this method returns they belong to the new session.
+                item = self._build_retain_kwargs(
+                    old_content,
+                    context=old_retain_context,
+                    metadata=old_metadata,
+                    tags=old_lineage_tags or None,
+                )
+                old_bank_id = self._bank_id
+                item.pop("bank_id", None)
+                item.pop("retain_async", None)
+                if old_update_mode is not None:
+                    item["update_mode"] = old_update_mode
+                old_row_id = self._outbox.enqueue(
+                    dedupe_key=(
+                        f"{old_document_id}:session-switch:"
+                        f"{old_turn_index}:{len(old_turns_to_flush)}"
+                    ),
+                    bank_id=old_bank_id,
+                    document_id=old_document_id,
+                    update_mode=old_update_mode,
+                    retain_async=old_retain_async,
+                    item=item,
+                )
 
-            def _flush():
-                try:
-                    item = self._build_retain_kwargs(
-                        old_content,
-                        context=self._retain_context,
-                        metadata=old_metadata,
-                        tags=old_lineage_tags or None,
-                    )
-                    item.pop("bank_id", None)
-                    item.pop("retain_async", None)
-                    if old_update_mode is not None:
-                        item["update_mode"] = old_update_mode
-                    logger.debug(
-                        "Hindsight flush-on-switch: bank=%s, doc=%s, mode=%s, num_turns=%d",
-                        self._bank_id, old_document_id, old_update_mode, len(old_turns),
-                    )
-                    self._run_hindsight_operation(
-                        lambda client: client.aretain_batch(
-                            bank_id=self._bank_id,
-                            items=[item],
-                            document_id=old_document_id,
-                            retain_async=self._retain_async,
+                def _flush():
+                    if self._shutting_down.is_set():
+                        return
+                    row = self._outbox.claim(old_row_id)
+                    if row is not None:
+                        logger.debug(
+                            "Hindsight flush-on-switch: bank=%s, doc=%s, mode=%s, num_turns=%d",
+                            old_bank_id,
+                            old_document_id,
+                            old_update_mode,
+                            len(old_turns_to_flush),
                         )
-                    )
-                except Exception as e:
-                    logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
+                        self._deliver_outbox_row(row)
 
-            # Route the flush through the same writer queue sync_turn
-            # uses. That serializes it behind any still-queued retains
-            # from the old session (FIFO by document_id), avoids racing
-            # two threads on aretain_batch against the same document, and
-            # keeps shutdown's drain semantics intact. Skip enqueue if
-            # shutdown has already fired — the writer is draining/gone.
-            if not self._shutting_down.is_set():
-                self._ensure_writer()
-                self._register_atexit()
-                self._retain_queue.put(_flush)
+                # Route the flush through the same writer queue sync_turn
+                # uses. That serializes it behind any still-queued retains
+                # from the old session (FIFO by document_id), avoids racing
+                # two threads on aretain_batch against the same document, and
+                # keeps shutdown's drain semantics intact. Skip enqueue if
+                # shutdown has already fired — the writer is draining/gone.
+                if not self._shutting_down.is_set():
+                    self._ensure_writer()
+                    self._register_atexit()
+                    self._retain_queue.put(_flush)
 
         # 2. Drain any in-flight prefetch from the old session and drop
         # its cached result so the new session doesn't see stale recall.

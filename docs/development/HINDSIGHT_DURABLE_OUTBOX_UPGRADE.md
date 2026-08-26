@@ -76,6 +76,9 @@ The local feature branch contains the following client-side changes:
 ### `plugins/memory/hindsight/__init__.py`
 
 - Persists the retain request before dispatching the in-memory writer job.
+- Persists session-switch flushes before dispatch too, snapshots the old session
+  state before rotation, and flushes only the unsent suffix for append-mode
+  documents.
 - Keeps the existing lazy writer behavior for new rows.
 - Adds a separate durable replay worker for rows left by a previous process or retry.
 - Passes the stable `operation_id` to `aretain_batch` when the installed SDK exposes
@@ -110,7 +113,8 @@ The tests cover:
 - successful acknowledgement;
 - stable operation ID delivery;
 - private database permissions;
-- provider behavior when Hindsight is offline.
+- provider behavior when Hindsight is offline, including session-switch flushes;
+- append-mode session-switch flushing without duplicate turns.
 
 Run them with an interpreter containing the pinned SDK:
 
@@ -130,7 +134,7 @@ Project:     hindsight
 Compose:     /mnt/user/appdata/hindsight/docker-compose.yml
 Working dir: /mnt/user/appdata/hindsight
 Service:     hindsight
-Image:       ghcr.io/vectorize-io/hindsight:latest
+Image:       ghcr.io/vectorize-io/hindsight:0.9.2
 Data:        /mnt/user/appdata/hindsight/data -> /home/hindsight/.pg0
 Codex:       /mnt/user/appdata/hindsight/codex -> /home/hindsight/codex
 Ports:       NAS:8889 -> container:8888
@@ -138,8 +142,7 @@ Ports:       NAS:8889 -> container:8888
 Restart:     unless-stopped
 ```
 
-The image should be verified by its OCI label and digest, not only by the mutable
-`latest` tag:
+The image should be verified by its OCI label and digest, not only by its tag:
 
 ```bash
 ssh nas 'docker inspect hindsight --format \
@@ -180,7 +183,7 @@ backup=/mnt/user/kosello/Backups/hindsight/$stamp
 mkdir -p "$backup"
 cp /mnt/user/appdata/hindsight/docker-compose.yml "$backup/"
 docker inspect hindsight > "$backup/container-inspect.json"
-docker image inspect ghcr.io/vectorize-io/hindsight:latest > "$backup/image-inspect.json"
+docker image inspect ghcr.io/vectorize-io/hindsight:0.9.2 > "$backup/image-inspect.json"
 docker compose -f /mnt/user/appdata/hindsight/docker-compose.yml stop hindsight
 tar --xattrs --acls -czf "$backup/appdata.tar.gz" -C /mnt/user/appdata hindsight
 docker compose -f /mnt/user/appdata/hindsight/docker-compose.yml start hindsight

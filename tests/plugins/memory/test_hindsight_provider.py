@@ -1143,6 +1143,32 @@ class TestSessionSwitchBufferFlush:
         assert p._document_id.startswith("new-sid-")
 
 
+    def test_session_switch_flush_is_durable_before_dispatch(self, provider_with_config):
+        """A switch flush must survive an outage and retain old-session metadata."""
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        old_doc = p._document_id
+        p.sync_turn("old-user", "old-assistant")
+        p.sync_turn("old-user-2", "old-assistant-2")
+
+        def offline(_operation):
+            raise ConnectionError("Hindsight offline")
+
+        p._run_hindsight_operation = offline
+        p.on_session_switch("new-sid", parent_session_id="new-parent", reset=True)
+        p._retain_queue.join()
+
+        # The failed flush was persisted before its writer job ran. Wait for
+        # the first retry window, then inspect the durable row directly.
+        import time
+        time.sleep(1.05)
+        row = p._outbox.claim_due(limit=1)[0]
+        assert row.document_id == old_doc
+        assert row.bank_id == "test-bank"
+        assert row.item["metadata"]["session_id"] == "test-session"
+        assert "old-user" in row.item["content"]
+        assert "old-user-2" in row.item["content"]
+        p._outbox.close()
+
     def test_in_flight_prefetch_thread_drained_on_switch(self, provider, monkeypatch):
         """on_session_switch must wait for an in-flight prefetch from the
         old session to settle before clearing _prefetch_result, otherwise
@@ -1291,6 +1317,35 @@ class TestUpdateModeAppendCapability:
         # Flush goes to the OLD session's stable doc, not new-sid's.
         assert kw["document_id"] == "test-session"
         assert kw["items"][0]["update_mode"] == "append"
+
+
+    def test_session_switch_flush_only_appends_unsent_turns(
+        self, provider_with_config, monkeypatch
+    ):
+        """Append-mode switch flushes only the suffix not already retained."""
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+        p.sync_turn("turn1-user", "turn1-asst")
+        p.sync_turn("turn2-user", "turn2-asst")
+        p._retain_queue.join()
+        p.sync_turn("turn3-user", "turn3-asst")
+
+        p.on_session_switch("new-sid", reset=True)
+        p._retain_queue.join()
+
+        assert p._client.aretain_batch.call_count == 2
+        first_content = json.dumps(p._client.aretain_batch.call_args_list[0].kwargs["items"])
+        second_content = json.dumps(p._client.aretain_batch.call_args_list[1].kwargs["items"])
+        assert "turn1-user" in first_content
+        assert "turn2-user" in first_content
+        assert "turn3-user" not in first_content
+        assert "turn3-user" in second_content
+        assert "turn1-user" not in second_content
+        assert "turn2-user" not in second_content
 
 
 # ---------------------------------------------------------------------------

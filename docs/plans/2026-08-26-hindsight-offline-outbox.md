@@ -20,6 +20,8 @@ This branch delivers the client-side durability slice only:
 - Startup replay of rows left by an earlier process, while fresh rows stay with the existing lazy writer.
 - Stable persisted `operation_id` values for asynchronous retain calls when supported by the SDK, preventing normal retry duplicates.
 - Graceful shutdown that does not close the outbox underneath a still-running worker.
+- Session-switch flushes persist the old-session payload before dispatch and append
+  only turns not already queued for the old document.
 
 The crash window is closed for supported asynchronous idempotency (`hindsight-client>=0.9.2` and Hindsight's existing API). Synchronous retains and older SDKs remain at-least-once if the process crashes after the server accepts a request but before local acknowledgement.
 
@@ -36,7 +38,7 @@ The following are intentionally separate follow-ups and are not acceptance crite
 - Concurrent outbox instances cannot claim the same row.
 - Shutdown does not lose rows already persisted in the outbox.
 - Hindsight's server, database, memory processing, and recall behavior remain unchanged.
-- Focused outbox and provider tests pass in an environment with `hindsight-client==0.8.6`.
+- Focused outbox and provider tests pass in an environment with `hindsight-client==0.9.2`.
 
 ## Non-goals
 
